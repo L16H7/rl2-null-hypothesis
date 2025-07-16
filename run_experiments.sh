@@ -34,7 +34,7 @@ run_experiment() {
     local config_file=$1
     local seed=$2
     local exp_type=$3
-    local save_dir="experiment_${exp_type}_${seed}"
+    local save_dir="/root/experiment_${exp_type}_${seed}"
     
     echo -e "${YELLOW}Starting $exp_type experiment with seed $seed...${NC}"
     echo -e "${YELLOW}Config: $config_file${NC}"

@@ -1,0 +1,15 @@
+project: "rl2-null-hypothesis"
+name: "PREV_REWARD"
+experiment_type: "PREV_REWARD"
+env_id: "XLand-MiniGrid-R4-9x9"
+benchmark_id: "high-1m"
+total_timesteps: 1_000_000_000
+num_envs: 8192
+num_steps_per_env: 2560
+num_steps_per_update: 256
+update_epochs: 1
+num_minibatches: 16
+eval_num_envs: 4096
+eval_num_episodes: 10
+obs_emb_dim: 32
+action_emb_dim: 32

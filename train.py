@@ -137,7 +137,6 @@ def make_states(config: TrainConfig):
     # [batch_size, seq_len, ...]
     shapes = env.observation_shape(env_params)
 
-    jax.debug.breakpoint()
     init_obs = {
         "obs_img": jnp.zeros((config.num_envs_per_device, 1, *shapes["img"])),
         "obs_dir": jnp.zeros((config.num_envs_per_device, 1, shapes["direction"])),
@@ -152,7 +151,6 @@ def make_states(config: TrainConfig):
         optax.inject_hyperparams(optax.adam)(learning_rate=linear_schedule, eps=1e-8),  # eps=1e-5
     )
     train_state = TrainState.create(apply_fn=network.apply, params=network_params, tx=tx)
-    jax.debug.breakpoint()
 
     return rng, env, env_params, benchmark, init_hstate, train_state
 
@@ -346,6 +344,7 @@ def train(config: TrainConfig):
     # logging to wandb
     run = wandb.init(
         project=config.project,
+        entity="l16h7",
         group=config.group,
         name=config.name,
         config=asdict(config),

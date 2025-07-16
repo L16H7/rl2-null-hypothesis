@@ -18,16 +18,30 @@ import wandb
 from flax.jax_utils import replicate, unreplicate
 from flax.training import orbax_utils
 from flax.training.train_state import TrainState
-from nn import ActorCriticRNN, ActorCriticRNNNull
+from nn import (
+    ActorCriticRNN,
+    ActorCriticRNNPrevAction,
+    ActorCriticRNNPrevReward,
+    ActorCriticRNNNull,
+)
 from utils import Transition, calculate_gae, ppo_update_networks, rollout
 
 import xminigrid
 from xminigrid.benchmarks import Benchmark
 from xminigrid.environment import Environment, EnvParams
 from xminigrid.wrappers import DirectionObservationWrapper, GymAutoResetWrapper
+from enum import Enum
+from typing import Literal
 
 # this will be default in new jax versions anyway
 jax.config.update("jax_threefry_partitionable", True)
+
+
+class ExperimentType(str, Enum):
+    META = "META"
+    PREV_ACTION = "PREV_ACTION"
+    PREV_REWARD = "PREV_REWARD"
+    NULL = "NULL"
 
 
 @dataclass
@@ -37,9 +51,7 @@ class TrainConfig:
     name: str = "meta-task-ppo"
     env_id: str = "XLand-MiniGrid-R1-9x9"
     benchmark_id: str = "trivial-1m"
-    img_obs: bool = False
-    # agent
-    use_meta_learning: bool = True  # True for H1 (meta-RL), False for H0 (regular RL)
+    experiment_type: ExperimentType = ExperimentType.META
     obs_emb_dim: int = 16
     action_emb_dim: int = 16
     rnn_hidden_dim: int = 1024
@@ -74,7 +86,8 @@ class TrainConfig:
         self.eval_num_envs_per_device = self.eval_num_envs // num_devices
         assert self.num_envs % num_devices == 0
         self.num_meta_updates = round(
-            self.total_timesteps_per_device / (self.num_envs_per_device * self.num_steps_per_env)
+            self.total_timesteps_per_device
+            / (self.num_envs_per_device * self.num_steps_per_env)
         )
         self.num_inner_updates = self.num_steps_per_env // self.num_steps_per_update
         assert self.num_steps_per_env % self.num_steps_per_update == 0
@@ -84,7 +97,9 @@ class TrainConfig:
 def make_states(config: TrainConfig):
     # for learning rage scheduling
     def linear_schedule(count):
-        total_inner_updates = config.num_minibatches * config.update_epochs * config.num_inner_updates
+        total_inner_updates = (
+            config.num_minibatches * config.update_epochs * config.num_inner_updates
+        )
         frac = 1.0 - (count // total_inner_updates) / config.num_meta_updates
         return config.lr * frac
 
@@ -96,12 +111,6 @@ def make_states(config: TrainConfig):
     env = GymAutoResetWrapper(env)
     env = DirectionObservationWrapper(env)
 
-    # enabling image observations if needed
-    if config.img_obs:
-        from xminigrid.experimental.img_obs import RGBImgObservationWrapper
-
-        env = RGBImgObservationWrapper(env)
-
     # loading benchmark
     benchmark = xminigrid.load_benchmark(config.benchmark_id)
 
@@ -110,8 +119,8 @@ def make_states(config: TrainConfig):
     rng, _rng = jax.random.split(rng)
 
     # Choose network based on config
-    if config.use_meta_learning:
-        print("Using meta-learning (H1) setup with prev_action and prev_reward.")
+    if config.experiment_type == ExperimentType.META:
+        print("Using RL^2 meta-learning Hypothesis (H1) setup.")
         network = ActorCriticRNN(
             num_actions=env.num_actions(env_params),
             obs_emb_dim=config.obs_emb_dim,
@@ -119,11 +128,32 @@ def make_states(config: TrainConfig):
             rnn_hidden_dim=config.rnn_hidden_dim,
             rnn_num_layers=config.rnn_num_layers,
             head_hidden_dim=config.head_hidden_dim,
-            img_obs=config.img_obs,
             dtype=jnp.bfloat16 if config.enable_bf16 else None,
         )
-    else:
-        print("Using null hypothesis (H0) setup without prev_action and prev_reward.")
+    elif config.experiment_type == ExperimentType.PREV_ACTION:
+        print("Using previous action setup")
+        network = ActorCriticRNNPrevAction(
+            num_actions=env.num_actions(env_params),
+            obs_emb_dim=config.obs_emb_dim,
+            action_emb_dim=config.action_emb_dim,
+            rnn_hidden_dim=config.rnn_hidden_dim,
+            rnn_num_layers=config.rnn_num_layers,
+            head_hidden_dim=config.head_hidden_dim,
+            dtype=jnp.bfloat16 if config.enable_bf16 else None,
+        )
+    elif config.experiment_type == ExperimentType.PREV_REWARD:
+        print("Using previous reward setup")
+        network = ActorCriticRNNPrevReward(
+            num_actions=env.num_actions(env_params),
+            obs_emb_dim=config.obs_emb_dim,
+            action_emb_dim=config.action_emb_dim,
+            rnn_hidden_dim=config.rnn_hidden_dim,
+            rnn_num_layers=config.rnn_num_layers,
+            head_hidden_dim=config.head_hidden_dim,
+            dtype=jnp.bfloat16 if config.enable_bf16 else None,
+        )
+    elif config.experiment_type == ExperimentType.NULL:
+        print("Using null hypothesis (H0) setup.")
         network = ActorCriticRNNNull(
             num_actions=env.num_actions(env_params),
             obs_emb_dim=config.obs_emb_dim,
@@ -131,9 +161,11 @@ def make_states(config: TrainConfig):
             rnn_hidden_dim=config.rnn_hidden_dim,
             rnn_num_layers=config.rnn_num_layers,
             head_hidden_dim=config.head_hidden_dim,
-            img_obs=config.img_obs,
             dtype=jnp.bfloat16 if config.enable_bf16 else None,
         )
+    else:
+        raise ValueError(f"Unknown experiment type: {config.experiment_type}")
+
     # [batch_size, seq_len, ...]
     shapes = env.observation_shape(env_params)
 
@@ -148,9 +180,13 @@ def make_states(config: TrainConfig):
     network_params = network.init(_rng, init_obs, init_hstate)
     tx = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
-        optax.inject_hyperparams(optax.adam)(learning_rate=linear_schedule, eps=1e-8),  # eps=1e-5
+        optax.inject_hyperparams(optax.adam)(
+            learning_rate=linear_schedule, eps=1e-8
+        ),  # eps=1e-5
     )
-    train_state = TrainState.create(apply_fn=network.apply, params=network_params, tx=tx)
+    train_state = TrainState.create(
+        apply_fn=network.apply, params=network_params, tx=tx
+    )
 
     return rng, env, env_params, benchmark, init_hstate, train_state
 
@@ -190,7 +226,14 @@ def make_train(
             def _update_step(runner_state, _):
                 # COLLECT TRAJECTORIES
                 def _env_step(runner_state, _):
-                    rng, train_state, prev_timestep, prev_action, prev_reward, prev_hstate = runner_state
+                    (
+                        rng,
+                        train_state,
+                        prev_timestep,
+                        prev_action,
+                        prev_reward,
+                        prev_hstate,
+                    ) = runner_state
 
                     # SELECT ACTION
                     rng, _rng = jax.random.split(rng)
@@ -208,10 +251,16 @@ def make_train(
                     )
                     action, log_prob = dist.sample_and_log_prob(seed=_rng)
                     # squeeze seq_len where possible
-                    action, value, log_prob = action.squeeze(1), value.squeeze(1), log_prob.squeeze(1)
+                    action, value, log_prob = (
+                        action.squeeze(1),
+                        value.squeeze(1),
+                        log_prob.squeeze(1),
+                    )
 
                     # STEP ENV
-                    timestep = jax.vmap(env.step, in_axes=0)(meta_env_params, prev_timestep, action)
+                    timestep = jax.vmap(env.step, in_axes=0)(
+                        meta_env_params, prev_timestep, action
+                    )
                     transition = Transition(
                         # ATTENTION: done is always false, as we optimize for entire meta-rollout
                         done=jnp.zeros_like(timestep.last()),
@@ -224,15 +273,26 @@ def make_train(
                         prev_action=prev_action,
                         prev_reward=prev_reward,
                     )
-                    runner_state = (rng, train_state, timestep, action, timestep.reward, hstate)
+                    runner_state = (
+                        rng,
+                        train_state,
+                        timestep,
+                        action,
+                        timestep.reward,
+                        hstate,
+                    )
                     return runner_state, transition
 
                 initial_hstate = runner_state[-1]
                 # transitions: [seq_len, batch_size, ...]
-                runner_state, transitions = jax.lax.scan(_env_step, runner_state, None, config.num_steps_per_update)
+                runner_state, transitions = jax.lax.scan(
+                    _env_step, runner_state, None, config.num_steps_per_update
+                )
 
                 # CALCULATE ADVANTAGE
-                rng, train_state, timestep, prev_action, prev_reward, hstate = runner_state
+                rng, train_state, timestep, prev_action, prev_reward, hstate = (
+                    runner_state
+                )
                 # calculate value of the last step for bootstrapping
                 _, last_val, _ = train_state.apply_fn(
                     train_state.params,
@@ -244,7 +304,9 @@ def make_train(
                     },
                     hstate,
                 )
-                advantages, targets = calculate_gae(transitions, last_val.squeeze(1), config.gamma, config.gae_lambda)
+                advantages, targets = calculate_gae(
+                    transitions, last_val.squeeze(1), config.gamma, config.gae_lambda
+                )
 
                 # UPDATE NETWORK
                 def _update_epoch(update_state, _):
@@ -262,47 +324,96 @@ def make_train(
                         )
                         return new_train_state, update_info
 
-                    rng, train_state, init_hstate, transitions, advantages, targets = update_state
+                    rng, train_state, init_hstate, transitions, advantages, targets = (
+                        update_state
+                    )
 
                     # MINIBATCHES PREPARATION
                     rng, _rng = jax.random.split(rng)
-                    permutation = jax.random.permutation(_rng, config.num_envs_per_device)
+                    permutation = jax.random.permutation(
+                        _rng, config.num_envs_per_device
+                    )
                     # [seq_len, batch_size, ...]
                     batch = (init_hstate, transitions, advantages, targets)
                     # [batch_size, seq_len, ...], as our model assumes
                     batch = jtu.tree_map(lambda x: x.swapaxes(0, 1), batch)
 
-                    shuffled_batch = jtu.tree_map(lambda x: jnp.take(x, permutation, axis=0), batch)
+                    shuffled_batch = jtu.tree_map(
+                        lambda x: jnp.take(x, permutation, axis=0), batch
+                    )
                     # [num_minibatches, minibatch_size, ...]
                     minibatches = jtu.tree_map(
-                        lambda x: jnp.reshape(x, (config.num_minibatches, -1) + x.shape[1:]), shuffled_batch
+                        lambda x: jnp.reshape(
+                            x, (config.num_minibatches, -1) + x.shape[1:]
+                        ),
+                        shuffled_batch,
                     )
-                    train_state, update_info = jax.lax.scan(_update_minbatch, train_state, minibatches)
+                    train_state, update_info = jax.lax.scan(
+                        _update_minbatch, train_state, minibatches
+                    )
 
-                    update_state = (rng, train_state, init_hstate, transitions, advantages, targets)
+                    update_state = (
+                        rng,
+                        train_state,
+                        init_hstate,
+                        transitions,
+                        advantages,
+                        targets,
+                    )
                     return update_state, update_info
 
                 # hstate shape: [seq_len=None, batch_size, num_layers, hidden_dim]
-                update_state = (rng, train_state, initial_hstate[None, :], transitions, advantages, targets)
-                update_state, loss_info = jax.lax.scan(_update_epoch, update_state, None, config.update_epochs)
+                update_state = (
+                    rng,
+                    train_state,
+                    initial_hstate[None, :],
+                    transitions,
+                    advantages,
+                    targets,
+                )
+                update_state, loss_info = jax.lax.scan(
+                    _update_epoch, update_state, None, config.update_epochs
+                )
                 # WARN: do not forget to get updated params
                 rng, train_state = update_state[:2]
 
                 # averaging over minibatches then over epochs
                 loss_info = jtu.tree_map(lambda x: x.mean(-1).mean(-1), loss_info)
-                runner_state = (rng, train_state, timestep, prev_action, prev_reward, hstate)
+                runner_state = (
+                    rng,
+                    train_state,
+                    timestep,
+                    prev_action,
+                    prev_reward,
+                    hstate,
+                )
                 return runner_state, loss_info
 
             # on each meta-update we reset rnn hidden to init_hstate
-            runner_state = (rng, train_state, timestep, prev_action, prev_reward, init_hstate)
-            runner_state, loss_info = jax.lax.scan(_update_step, runner_state, None, config.num_inner_updates)
+            runner_state = (
+                rng,
+                train_state,
+                timestep,
+                prev_action,
+                prev_reward,
+                init_hstate,
+            )
+            runner_state, loss_info = jax.lax.scan(
+                _update_step, runner_state, None, config.num_inner_updates
+            )
             # WARN: do not forget to get updated params
             rng, train_state = runner_state[:2]
 
             # EVALUATE AGENT
-            eval_ruleset_rng, eval_reset_rng = jax.random.split(jax.random.key(config.eval_seed))
-            eval_ruleset_rng = jax.random.split(eval_ruleset_rng, num=config.eval_num_envs_per_device)
-            eval_reset_rng = jax.random.split(eval_reset_rng, num=config.eval_num_envs_per_device)
+            eval_ruleset_rng, eval_reset_rng = jax.random.split(
+                jax.random.key(config.eval_seed)
+            )
+            eval_ruleset_rng = jax.random.split(
+                eval_ruleset_rng, num=config.eval_num_envs_per_device
+            )
+            eval_reset_rng = jax.random.split(
+                eval_reset_rng, num=config.eval_num_envs_per_device
+            )
 
             eval_ruleset = jax.vmap(benchmark.sample_ruleset)(eval_ruleset_rng)
             eval_env_params = env_params.replace(ruleset=eval_ruleset)
@@ -324,8 +435,12 @@ def make_train(
                     "eval/returns_mean": eval_stats.reward.mean(0),
                     "eval/returns_median": jnp.median(eval_stats.reward),
                     "eval/lengths": eval_stats.length.mean(0),
-                    "eval/lengths_20percentile": jnp.percentile(eval_stats.length, q=20),
-                    "eval/returns_20percentile": jnp.percentile(eval_stats.reward, q=20),
+                    "eval/lengths_20percentile": jnp.percentile(
+                        eval_stats.length, q=20
+                    ),
+                    "eval/returns_20percentile": jnp.percentile(
+                        eval_stats.reward, q=20
+                    ),
                     "lr": train_state.opt_state[-1].hyperparams["learning_rate"],
                 }
             )
@@ -333,7 +448,9 @@ def make_train(
             return meta_state, loss_info
 
         meta_state = (rng, train_state)
-        meta_state, loss_info = jax.lax.scan(_meta_step, meta_state, None, config.num_meta_updates)
+        meta_state, loss_info = jax.lax.scan(
+            _meta_step, meta_state, None, config.num_meta_updates
+        )
         return {"state": meta_state[-1], "loss_info": loss_info}
 
     return train
@@ -378,16 +495,25 @@ def train(config: TrainConfig):
 
     total_transitions = 0
     for i in range(config.num_meta_updates):
-        total_transitions += config.num_steps_per_env * config.num_envs_per_device * jax.local_device_count()
+        total_transitions += (
+            config.num_steps_per_env
+            * config.num_envs_per_device
+            * jax.local_device_count()
+        )
         info = jtu.tree_map(lambda x: x[i].item(), loss_info)
         info["transitions"] = total_transitions
         wandb.log(info)
 
     run.summary["training_time"] = elapsed_time
-    run.summary["steps_per_second"] = (config.total_timesteps_per_device * jax.local_device_count()) / elapsed_time
+    run.summary["steps_per_second"] = (
+        config.total_timesteps_per_device * jax.local_device_count()
+    ) / elapsed_time
 
     if config.checkpoint_path is not None:
-        checkpoint = {"config": asdict(config), "params": unreplicate(train_info)["state"].params}
+        checkpoint = {
+            "config": asdict(config),
+            "params": unreplicate(train_info)["state"].params,
+        }
         orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
         save_args = orbax_utils.save_args_from_target(checkpoint)
         orbax_checkpointer.save(config.checkpoint_path, checkpoint, save_args=save_args)

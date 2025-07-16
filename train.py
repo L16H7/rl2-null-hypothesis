@@ -237,7 +237,6 @@ def make_train(
 
                     # SELECT ACTION
                     rng, _rng = jax.random.split(rng)
-                    jax.debug.breakpoint()
                     dist, value, hstate = train_state.apply_fn(
                         train_state.params,
                         {

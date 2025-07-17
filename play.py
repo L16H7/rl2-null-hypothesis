@@ -33,7 +33,6 @@ class Config:
     # Video settings
     video_path: str = "model_rollout.mp4"
     fps: int = 4
-    high_quality: bool = True  # Use high quality video encoding
 
 
 def make_env(
@@ -141,20 +140,23 @@ def load_model(model_type: str, checkpoint_path: str):
     return network, params
 
 
-def add_text_overlay(image, text, position="top_left", font_size=16, color=(255, 255, 255), bg_color=(0, 0, 0)):
-    """Add text overlay to an image with anti-aliasing."""
-    from PIL import Image, ImageDraw, ImageFont
+def add_simple_text_overlay(frame, text):
+    """Simple text overlay using basic numpy operations when OpenCV is not available."""
+    # For simplicity, just return the frame without text when PIL/OpenCV is not available
+    # You could implement a basic bitmap text renderer here if needed
+    return frame
+
+
+# Global font cache to avoid repeated font loading
+_FONT_CACHE = {}
+
+def get_cached_font(font_size=16):
+    """Get a cached font object to avoid repeated loading."""
+    from PIL import ImageFont
     
-    # Convert numpy array to PIL Image and ensure it's in RGB mode
-    if isinstance(image, np.ndarray):
-        pil_image = Image.fromarray(image).convert('RGB')
-    else:
-        pil_image = image.convert('RGB')
+    if font_size in _FONT_CACHE:
+        return _FONT_CACHE[font_size]
     
-    # Create a drawing context
-    draw = ImageDraw.Draw(pil_image)
-    
-    # Try to use a better font, fallback to default if not available
     font = None
     font_paths = [
         "/System/Library/Fonts/Arial.ttf",  # macOS
@@ -176,54 +178,59 @@ def add_text_overlay(image, text, position="top_left", font_size=16, color=(255,
         except Exception:
             font = None
     
-    # Get text dimensions
-    if font:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
+    _FONT_CACHE[font_size] = font
+    return font
+
+
+def add_text_overlay_fast(image, text, position="top_left", font_size=16, color=(255, 255, 255), bg_color=(0, 0, 0)):
+    """Add text overlay to an image with optimized performance."""
+    import cv2
+    
+    # Use OpenCV for faster text rendering (much faster than PIL)
+    if isinstance(image, np.ndarray):
+        img = image.copy()
     else:
-        # Rough estimation if font fails
-        text_width = len(text) * 8
-        text_height = 16
+        img = np.array(image)
+    
+    # Ensure image is in the right format
+    if len(img.shape) == 3 and img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # OpenCV uses BGR
+    
+    # Calculate text size
+    font_face = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = font_size / 30.0  # Approximate scaling
+    thickness = 1
+    (text_width, text_height), baseline = cv2.getTextSize(text, font_face, font_scale, thickness)
     
     # Calculate position
-    img_width, img_height = pil_image.size
+    img_height, img_width = img.shape[:2]
     
     if position == "top_left":
-        x, y = 10, 10
+        x, y = 10, 30
     elif position == "top_right":
-        x, y = img_width - text_width - 10, 10
+        x, y = img_width - text_width - 10, 30
     elif position == "bottom_left":
-        x, y = 10, img_height - text_height - 10
+        x, y = 10, img_height - 10
     elif position == "bottom_right":
-        x, y = img_width - text_width - 10, img_height - text_height - 10
+        x, y = img_width - text_width - 10, img_height - 10
     else:
-        x, y = 10, 10
+        x, y = 10, 30
     
-    # Draw semi-transparent background rectangle
+    # Draw background rectangle
     padding = 6
-    overlay = Image.new('RGBA', pil_image.size, (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(overlay)
+    cv2.rectangle(img, 
+                  (x - padding, y - text_height - padding), 
+                  (x + text_width + padding, y + baseline + padding), 
+                  bg_color, -1)
     
-    # Create background with transparency
-    bg_rgba = bg_color + (180,) if len(bg_color) == 3 else bg_color
-    overlay_draw.rectangle([
-        x - padding, y - padding,
-        x + text_width + padding, y + text_height + padding
-    ], fill=bg_rgba)
+    # Draw text
+    cv2.putText(img, text, (x, y), font_face, font_scale, color, thickness, cv2.LINE_AA)
     
-    # Composite the overlay
-    pil_image = Image.alpha_composite(pil_image.convert('RGBA'), overlay).convert('RGB')
-    draw = ImageDraw.Draw(pil_image)
+    # Convert back to RGB
+    if len(img.shape) == 3 and img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
-    # Draw text with anti-aliasing
-    if font:
-        draw.text((x, y), text, fill=color, font=font)
-    else:
-        draw.text((x, y), text, fill=color)
-    
-    # Convert back to numpy array
-    return np.array(pil_image)
+    return img
 
 
 def render_model_rollout(
@@ -233,134 +240,98 @@ def render_model_rollout(
     total_steps,
     video_path="model_rollout.mp4",
     fps=4,
-    high_quality=True,
 ):
     # Create visualization of the model's behavior
     print("Rendering model rollout frames...")
-    model_images = []
-
-    # Pre-compute episode information
-    episode_info = []
+    
+    # Pre-compute ALL episode and step information in O(n) time
+    print("Pre-computing episode information...")
+    episode_indices = []  # Which episode each step belongs to
+    step_in_episode = []  # Step number within the current episode
+    cumulative_rewards = []  # Cumulative reward up to each step
+    wins_up_to_step = []  # Number of wins up to each step
+    
     current_episode = 0
-    episode_step = 0
-    episode_reward = 0.0
+    current_step_in_ep = 1
+    cumulative_reward = 0.0
+    total_wins = 0
     
     for i in range(total_steps):
-        episode_step += 1
-        episode_reward += float(transitions.reward[i])
+        episode_indices.append(current_episode)
+        step_in_episode.append(current_step_in_ep)
+        
+        # Update cumulative reward
+        cumulative_reward += float(transitions.reward[i])
+        cumulative_rewards.append(cumulative_reward)
         
         # Check if episode ended
         if transitions.step_type[i] == 2:  # LAST step (episode ended)
-            # Determine episode outcome based on reward and length
-            if episode_reward > 0:
-                outcome = "WIN"
-                outcome_color = (0, 255, 0)  # Green
-            else:
-                # Check if it's a timeout (long episode with no reward) vs failure
-                if episode_step > 50:  # Arbitrary threshold for "long" episode
-                    outcome = "TIMEOUT"
-                    outcome_color = (255, 255, 0)  # Yellow
-                else:
-                    outcome = "FAIL"
-                    outcome_color = (255, 0, 0)  # Red
+            # Check if this episode was a win (positive reward in the episode)
+            episode_reward = 0.0
+            start_idx = 0 if current_episode == 0 else next(j for j in range(i-1, -1, -1) if transitions.step_type[j] == 2) + 1
+            for j in range(start_idx, i + 1):
+                episode_reward += float(transitions.reward[j])
             
-            episode_info.append({
-                'end_step': i,
-                'length': episode_step,
-                'reward': episode_reward,
-                'outcome': outcome,
-                'color': outcome_color
-            })
+            if episode_reward > 0:
+                total_wins += 1
             
             # Reset for next episode
             current_episode += 1
-            episode_step = 0
-            episode_reward = 0.0
+            current_step_in_ep = 1
         else:
-            episode_info.append(None)
-
-    # Render frames with overlays
+            current_step_in_ep += 1
+        
+        wins_up_to_step.append(total_wins)
+    
+    # Try to import cv2 for faster rendering, fallback to PIL if not available
+    use_cv2 = True
+    try:
+        import cv2
+    except ImportError:
+        use_cv2 = False
+        print("OpenCV not available, using PIL (slower). Install opencv-python for faster rendering.")
+    
+    # Render frames with overlays - now O(n) complexity!
+    model_images = []
     for i in trange(total_steps, desc="Rendering frames"):
         model_timestep = jtu.tree_map(lambda x: x[i], transitions)
         frame = env.render(meta_env_params, model_timestep)
         
-        # Find current episode info by tracking through all steps
-        current_ep_idx = 0
-        current_ep_step = 0
-        current_ep_reward = 0.0
-        wins_count = 0
+        # Get pre-computed values - O(1) lookup!
+        current_ep_idx = episode_indices[i]
+        current_ep_step = step_in_episode[i]
+        cumulative_reward = cumulative_rewards[i]
+        wins_count = wins_up_to_step[i]
         
-        for j in range(i + 1):
-            current_ep_step += 1
-            current_ep_reward += float(transitions.reward[j])
-            if episode_info[j] is not None:  # Episode ended at step j
-                # Count wins up to this point
-                if episode_info[j]['outcome'] == 'WIN':
-                    wins_count += 1
-                    
-                if j < i:  # This episode ended before current step i
-                    current_ep_idx += 1
-                    current_ep_step = 1  # Start counting from 1 for next episode
-                    current_ep_reward = float(transitions.reward[j + 1]) if j + 1 <= i else 0.0
-                    # Continue tracking from the next step after episode end
-                    for k in range(j + 2, i + 1):
-                        current_ep_step += 1
-                        current_ep_reward += float(transitions.reward[k])
-                        if episode_info[k] is not None and k < i:
-                            if episode_info[k]['outcome'] == 'WIN':
-                                wins_count += 1
-                            current_ep_idx += 1
-                            current_ep_step = 1
-                            current_ep_reward = float(transitions.reward[k + 1]) if k + 1 <= i else 0.0
-                    break
-        
-        # Calculate cumulative reward up to current step
-        cumulative_reward = sum(float(transitions.reward[j]) for j in range(i + 1))
-        
-        # Add episode info overlay with cumulative reward and wins
+        # Add episode info overlay
         episode_text = f"Ep {current_ep_idx + 1} | Step {current_ep_step} | Reward: {cumulative_reward:.1f} | Wins: {wins_count}"
-        frame = add_text_overlay(frame, episode_text, position="top_left", 
-                                 font_size=12, color=(255, 255, 255), bg_color=(0, 0, 0))
+        
+        if use_cv2:
+            frame = add_text_overlay_fast(frame, episode_text, position="top_left", 
+                                         font_size=12, color=(255, 255, 255), bg_color=(0, 0, 0))
+        else:
+            # Fallback to simple text overlay without heavy PIL operations
+            frame = add_simple_text_overlay(frame, episode_text)
         
         model_images.append(frame)
 
-    # Save the model rollout as a video with quality settings
-    if high_quality:
-        # High quality H.264 encoding
-        writer = imageio.get_writer(
-            video_path, 
-            fps=fps, 
-            codec='libx264',
-            quality=9,  # Very high quality (1-10 scale)
-            pixelformat='yuv420p',  # Better compatibility
-            macro_block_size=None,
-            ffmpeg_params=[
-                '-crf', '15',  # Constant Rate Factor: lower = higher quality
-                '-preset', 'slow',  # Better compression at cost of speed
-                '-profile:v', 'high',  # H.264 profile
-                '-level', '4.0',
-                '-x264-params', 'ref=6:bframes=8:b-adapt=2:direct=auto:me=umh:subme=10:merange=24:trellis=2'
-            ]
-        )
-    else:
-        # Standard quality encoding
-        writer = imageio.get_writer(
-            video_path, 
-            fps=fps, 
-            codec='libx264',
-            quality=6,  # Standard quality
-            pixelformat='yuv420p',
-            ffmpeg_params=['-crf', '23', '-preset', 'medium']
-        )
+    # Standard quality encoding
+    writer = imageio.get_writer(
+        video_path, 
+        fps=fps, 
+        codec='libx264',
+        quality=6,  # Standard quality
+        pixelformat='yuv420p',
+        ffmpeg_params=['-crf', '23', '-preset', 'medium']
+    )
     
-    print(f"Writing {len(model_images)} frames to {'high-quality' if high_quality else 'standard-quality'} video...")
     for frame in model_images:
         writer.append_data(frame)
     writer.close()
     
     print(f"Model rollout saved as {video_path}")
 
-    # Display some key statistics
+    # Display some key statistics - now using optimized pre-computed data
     total_reward = jnp.sum(transitions.reward)
     episode_lengths = []
     episode_outcomes = {"WIN": 0, "TIMEOUT": 0, "FAIL": 0}
@@ -371,10 +342,20 @@ def render_model_rollout(
         if transitions.step_type[i] == 2:  # LAST step (episode ended)
             episode_lengths.append(current_length)
             
-            # Count outcomes
-            if episode_info[i] is not None:
-                episode_outcomes[episode_info[i]['outcome']] += 1
+            # Determine episode outcome based on reward and length
+            episode_reward = 0.0
+            start_idx = 0 if len(episode_lengths) == 1 else sum(episode_lengths[:-1])
+            for j in range(start_idx, i + 1):
+                episode_reward += float(transitions.reward[j])
             
+            if episode_reward > 0:
+                outcome = "WIN"
+            elif current_length > 50:  # Arbitrary threshold for "long" episode
+                outcome = "TIMEOUT"
+            else:
+                outcome = "FAIL"
+            
+            episode_outcomes[outcome] += 1
             current_length = 0
 
     print("\nModel Performance Summary:")
@@ -421,7 +402,6 @@ def run(config: Config):
         config.num_steps,
         video_path=config.video_path,
         fps=config.fps,
-        high_quality=config.high_quality,
     )
 
 

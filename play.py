@@ -32,7 +32,7 @@ class Config:
 
     # Video settings
     video_path: str = "model_rollout.mp4"
-    fps: int = 30
+    fps: int = 4
     high_quality: bool = True  # Use high quality video encoding
 
 
@@ -232,7 +232,7 @@ def render_model_rollout(
     transitions,
     total_steps,
     video_path="model_rollout.mp4",
-    fps=32,
+    fps=4,
     high_quality=True,
 ):
     # Create visualization of the model's behavior
@@ -284,32 +284,43 @@ def render_model_rollout(
         model_timestep = jtu.tree_map(lambda x: x[i], transitions)
         frame = env.render(meta_env_params, model_timestep)
         
-        # Find current episode info
+        # Find current episode info by tracking through all steps
         current_ep_idx = 0
         current_ep_step = 0
         current_ep_reward = 0.0
+        wins_count = 0
         
         for j in range(i + 1):
             current_ep_step += 1
             current_ep_reward += float(transitions.reward[j])
-            if episode_info[j] is not None:  # Episode ended
-                if j < i:  # This episode ended before current step
+            if episode_info[j] is not None:  # Episode ended at step j
+                # Count wins up to this point
+                if episode_info[j]['outcome'] == 'WIN':
+                    wins_count += 1
+                    
+                if j < i:  # This episode ended before current step i
                     current_ep_idx += 1
-                    current_ep_step = 0
-                    current_ep_reward = 0.0
-                break
+                    current_ep_step = 1  # Start counting from 1 for next episode
+                    current_ep_reward = float(transitions.reward[j + 1]) if j + 1 <= i else 0.0
+                    # Continue tracking from the next step after episode end
+                    for k in range(j + 2, i + 1):
+                        current_ep_step += 1
+                        current_ep_reward += float(transitions.reward[k])
+                        if episode_info[k] is not None and k < i:
+                            if episode_info[k]['outcome'] == 'WIN':
+                                wins_count += 1
+                            current_ep_idx += 1
+                            current_ep_step = 1
+                            current_ep_reward = float(transitions.reward[k + 1]) if k + 1 <= i else 0.0
+                    break
         
-        # Add episode info overlay
-        episode_text = f"Episode {current_ep_idx + 1} | Step {current_ep_step} | Reward: {current_ep_reward:.1f}"
+        # Calculate cumulative reward up to current step
+        cumulative_reward = sum(float(transitions.reward[j]) for j in range(i + 1))
+        
+        # Add episode info overlay with cumulative reward and wins
+        episode_text = f"Ep {current_ep_idx + 1} | Step {current_ep_step} | Reward: {cumulative_reward:.1f} | Wins: {wins_count}"
         frame = add_text_overlay(frame, episode_text, position="top_left", 
-                                 font_size=16, color=(255, 255, 255), bg_color=(0, 0, 0))
-        
-        # Add outcome overlay if episode just ended
-        if episode_info[i] is not None:
-            ep_info = episode_info[i]
-            outcome_text = f"{ep_info['outcome']} | Length: {ep_info['length']} | Final Reward: {ep_info['reward']:.1f}"
-            frame = add_text_overlay(frame, outcome_text, position="bottom_left",
-                                    font_size=18, color=ep_info['color'], bg_color=(0, 0, 0))
+                                 font_size=12, color=(255, 255, 255), bg_color=(0, 0, 0))
         
         model_images.append(frame)
 
